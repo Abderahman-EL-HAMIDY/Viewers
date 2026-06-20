@@ -1618,11 +1618,13 @@ function commandsModule({
     },
 
     /**
-     * Captures the active viewport, sends it to the lung segmentation API,
-     * and writes the returned mask into a newly created labelmap.
+     * Captures the active viewport's native image data, sends it to the
+     * lung segmentation API, and writes the returned mask into a newly
+     * created labelmap, matching the image's native pixel resolution
+     * throughout to avoid any size mismatch.
      *
-     * @param props.viewportId - The viewport whose current image will be sent
-     *        for segmentation.
+     * @param props.viewportId - The viewport whose current image will be
+     *        sent for segmentation.
      * @param props.apiBaseUrl - Base URL of the deployed FastAPI segmentation
      *        service (e.g. an ngrok URL), without a trailing slash.
      */
@@ -1637,20 +1639,59 @@ function commandsModule({
         throw new Error('apiBaseUrl is required, e.g. your ngrok URL');
       }
 
-      // 1. Capture the current viewport as a PNG image
-      const viewportDiv = document.querySelector(`div[data-viewport-uid="${viewportId}"]`);
-      if (!viewportDiv) {
+      // 1. Get the active viewport and its current native image
+      const viewport = cornerstoneViewportService.getCornerstoneViewport(viewportId);
+      if (!viewport) {
         throw new Error(`No viewport found for id ${viewportId}`);
       }
-      const canvas = await html2canvas(viewportDiv as HTMLElement);
+
+      const imageId = viewport.getCurrentImageId ? viewport.getCurrentImageId() : null;
+      if (!imageId) {
+        throw new Error('Could not determine the current image id for this viewport');
+      }
+
+      const image = cache.getImage(imageId);
+      if (!image) {
+        throw new Error(`No cached image found for imageId ${imageId}`);
+      }
+
+      const nativeWidth = image.width;
+      const nativeHeight = image.height;
+
+      // 2. Build a PNG at the image's NATIVE resolution from its raw pixel
+      //    data, instead of screen-capturing the rendered viewport (which
+      //    is at an arbitrary, unrelated CSS pixel size).
+      const pixelData = image.getPixelData();
+
+      const offscreenCanvas = document.createElement('canvas');
+      offscreenCanvas.width = nativeWidth;
+      offscreenCanvas.height = nativeHeight;
+      const ctx = offscreenCanvas.getContext('2d');
+      const imageDataObj = ctx.createImageData(nativeWidth, nativeHeight);
+
+      // Normalize pixel values to 0-255 grayscale RGBA for the PNG.
+      const minVal = image.minPixelValue ?? 0;
+      const maxVal = image.maxPixelValue ?? 255;
+      const range = maxVal - minVal || 1;
+
+      for (let i = 0; i < nativeWidth * nativeHeight; i++) {
+        const raw = pixelData[i];
+        const normalized = Math.max(0, Math.min(255, ((raw - minVal) / range) * 255));
+        imageDataObj.data[i * 4] = normalized;
+        imageDataObj.data[i * 4 + 1] = normalized;
+        imageDataObj.data[i * 4 + 2] = normalized;
+        imageDataObj.data[i * 4 + 3] = 255;
+      }
+      ctx.putImageData(imageDataObj, 0, 0);
+
       const blob: Blob = await new Promise((resolve, reject) => {
-        canvas.toBlob(
+        offscreenCanvas.toBlob(
           b => (b ? resolve(b) : reject(new Error('Failed to create blob from canvas'))),
           'image/png'
         );
       });
 
-      // 2. Send the captured image to the deployed segmentation API
+      // 3. Send the native-resolution image to the deployed segmentation API
       const formData = new FormData();
       formData.append('file', blob, 'capture.png');
 
@@ -1663,14 +1704,21 @@ function commandsModule({
       }
       const result = await response.json();
 
-      // 3. Decode the base64 raw labelmap into a Uint8Array
+      if (result.mask_width !== nativeWidth || result.mask_height !== nativeHeight) {
+        throw new Error(
+          `Mask dimensions (${result.mask_width}x${result.mask_height}) do not match ` +
+            `native image dimensions (${nativeWidth}x${nativeHeight})`
+        );
+      }
+
+      // 4. Decode the base64 raw labelmap into a Uint8Array
       const binaryString = atob(result.mask_data);
       const maskBytes = new Uint8Array(binaryString.length);
       for (let i = 0; i < binaryString.length; i++) {
         maskBytes[i] = binaryString.charCodeAt(i);
       }
 
-      // 4. Create an empty labelmap container for this viewport
+      // 5. Create an empty labelmap container for this viewport
       const segmentationId = await createSegmentationForViewport(servicesManager, {
         viewportId,
         segmentationType: SegmentationRepresentations.Labelmap,
@@ -1683,11 +1731,10 @@ function commandsModule({
         throw new Error('Failed to create labelmap for viewport');
       }
 
-      // 5. Fetch the derived labelmap image(s) for this segmentation and
-      //    write the decoded mask bytes into each one. For stack viewports
-      //    (e.g. a single 2D chest X-ray), the labelmap is represented as
-      //    one or more derived images via cache.getImage(imageId), each
-      //    carrying its own voxelManager -- there is no single volumeId.
+      // 6. Fetch the derived labelmap image(s) and write the mask bytes
+      //    into each one. Since we matched native resolution end-to-end,
+      //    maskBytes.length should now equal each derived image's expected
+      //    scalar data length.
       const segmentation = segmentationService.getSegmentation(segmentationId);
       const labelmapData = segmentation.representationData[SegmentationRepresentations.Labelmap];
       if (!labelmapData || !labelmapData.imageIds?.length) {
@@ -1699,10 +1746,6 @@ function commandsModule({
         if (!derivedImage?.voxelManager) {
           throw new Error(`Derived image ${derivedImageId} has no voxelManager`);
         }
-
-        // NOTE: maskBytes length must match this image's expected scalar
-        // data length. If the model's mask resolution differs from the
-        // viewport's image resolution, resize/resample maskBytes first.
         derivedImage.voxelManager.setScalarData(maskBytes);
       });
 
