@@ -1683,22 +1683,29 @@ function commandsModule({
         throw new Error('Failed to create labelmap for viewport');
       }
 
-      // 5. Fetch the underlying volume for the created labelmap and write
-      //    the decoded mask bytes into it.
+      // 5. Fetch the derived labelmap image(s) for this segmentation and
+      //    write the decoded mask bytes into each one. For stack viewports
+      //    (e.g. a single 2D chest X-ray), the labelmap is represented as
+      //    one or more derived images via cache.getImage(imageId), each
+      //    carrying its own voxelManager -- there is no single volumeId.
       const segmentation = segmentationService.getSegmentation(segmentationId);
       const labelmapData = segmentation.representationData[SegmentationRepresentations.Labelmap];
-      if (!labelmapData || !labelmapData.volumeId) {
-        throw new Error('Created segmentation has no volume to write into');
+      if (!labelmapData || !labelmapData.imageIds?.length) {
+        throw new Error('Created segmentation has no derived images to write into');
       }
-      const labelmapVolume = cache.getVolume(labelmapData.volumeId);
-      const voxelManager = labelmapVolume.voxelManager;
 
-      // NOTE: maskBytes length must match the volume's expected scalar data
-      // length. If the model's mask resolution differs from the volume's
-      // resolution, resize/resample maskBytes before calling setScalarData.
-      voxelManager.setScalarData(maskBytes);
+      labelmapData.imageIds.forEach(derivedImageId => {
+        const derivedImage = cache.getImage(derivedImageId);
+        if (!derivedImage?.voxelManager) {
+          throw new Error(`Derived image ${derivedImageId} has no voxelManager`);
+        }
 
-      labelmapVolume.modified?.();
+        // NOTE: maskBytes length must match this image's expected scalar
+        // data length. If the model's mask resolution differs from the
+        // viewport's image resolution, resize/resample maskBytes first.
+        derivedImage.voxelManager.setScalarData(maskBytes);
+      });
+
       getRenderingEngines().forEach(engine => engine.render());
 
       return segmentationId;
