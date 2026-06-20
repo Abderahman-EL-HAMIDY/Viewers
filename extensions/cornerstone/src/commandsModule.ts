@@ -3,6 +3,7 @@ import {
   utilities as csUtils,
   Types as CoreTypes,
   getRenderingEngines,
+  cache,
 } from '@cornerstonejs/core';
 import {
   ToolGroupManager,
@@ -51,6 +52,7 @@ import { updateSegmentBidirectionalStats } from './utils/updateSegmentationStats
 import { generateSegmentationCSVReport } from './utils/generateSegmentationCSVReport';
 import { getUpdatedViewportsForSegmentation } from './utils/hydrationUtils';
 import { SegmentationRepresentations } from '@cornerstonejs/tools/enums';
+import html2canvas from 'html2canvas';
 import { isMeasurementWithinViewport } from './utils/isMeasurementWithinViewport';
 import { getCenterExtent } from './utils/getCenterExtent';
 import { EasingFunctionEnum } from './utils/transitions';
@@ -1616,6 +1618,93 @@ function commandsModule({
     },
 
     /**
+     * Captures the active viewport, sends it to the lung segmentation API,
+     * and writes the returned mask into a newly created labelmap.
+     *
+     * @param props.viewportId - The viewport whose current image will be sent
+     *        for segmentation.
+     * @param props.apiBaseUrl - Base URL of the deployed FastAPI segmentation
+     *        service (e.g. an ngrok URL), without a trailing slash.
+     */
+    segmentLungWithAI: async ({
+      viewportId,
+      apiBaseUrl,
+    }: {
+      viewportId: string;
+      apiBaseUrl: string;
+    }) => {
+      if (!apiBaseUrl) {
+        throw new Error('apiBaseUrl is required, e.g. your ngrok URL');
+      }
+
+      // 1. Capture the current viewport as a PNG image
+      const viewportDiv = document.querySelector(`div[data-viewport-uid="${viewportId}"]`);
+      if (!viewportDiv) {
+        throw new Error(`No viewport found for id ${viewportId}`);
+      }
+      const canvas = await html2canvas(viewportDiv as HTMLElement);
+      const blob: Blob = await new Promise((resolve, reject) => {
+        canvas.toBlob(
+          b => (b ? resolve(b) : reject(new Error('Failed to create blob from canvas'))),
+          'image/png'
+        );
+      });
+
+      // 2. Send the captured image to the deployed segmentation API
+      const formData = new FormData();
+      formData.append('file', blob, 'capture.png');
+
+      const response = await fetch(`${apiBaseUrl}/segment-lung`, {
+        method: 'POST',
+        body: formData,
+      });
+      if (!response.ok) {
+        throw new Error(`Segmentation API returned status ${response.status}`);
+      }
+      const result = await response.json();
+
+      // 3. Decode the base64 raw labelmap into a Uint8Array
+      const binaryString = atob(result.mask_data);
+      const maskBytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        maskBytes[i] = binaryString.charCodeAt(i);
+      }
+
+      // 4. Create an empty labelmap container for this viewport
+      const segmentationId = await createSegmentationForViewport(servicesManager, {
+        viewportId,
+        segmentationType: SegmentationRepresentations.Labelmap,
+        options: {
+          label: 'AI Lung Segmentation',
+          createInitialSegment: true,
+        },
+      });
+      if (!segmentationId) {
+        throw new Error('Failed to create labelmap for viewport');
+      }
+
+      // 5. Fetch the underlying volume for the created labelmap and write
+      //    the decoded mask bytes into it.
+      const segmentation = segmentationService.getSegmentation(segmentationId);
+      const labelmapData = segmentation.representationData[SegmentationRepresentations.Labelmap];
+      if (!labelmapData || !labelmapData.volumeId) {
+        throw new Error('Created segmentation has no volume to write into');
+      }
+      const labelmapVolume = cache.getVolume(labelmapData.volumeId);
+      const voxelManager = labelmapVolume.voxelManager;
+
+      // NOTE: maskBytes length must match the volume's expected scalar data
+      // length. If the model's mask resolution differs from the volume's
+      // resolution, resize/resample maskBytes before calling setScalarData.
+      voxelManager.setScalarData(maskBytes);
+
+      labelmapVolume.modified?.();
+      getRenderingEngines().forEach(engine => engine.render());
+
+      return segmentationId;
+    },
+
+    /**
      * Sets the active segmentation for a viewport
      * @param props.segmentationId - The ID of the segmentation to set as active
      */
@@ -2709,6 +2798,9 @@ function commandsModule({
     },
     createContourForViewport: {
       commandFn: actions.createContourForViewport,
+    },
+    segmentLungWithAI: {
+      commandFn: actions.segmentLungWithAI,
     },
     setActiveSegmentation: {
       commandFn: actions.setActiveSegmentation,
